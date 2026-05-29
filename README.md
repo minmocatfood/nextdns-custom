@@ -17,6 +17,7 @@ blocklists**. For large-scale filtering, prefer using NextDNS's built-in curated
 - Import domains from a file or URL
 - Export current list to a file for backup
 - List and clear all entries in a list
+- Delta-aware add/import/remove operations that skip unchanged entries
 - Parallel API requests for faster bulk operations
 - Dry-run mode to preview changes before applying
 - Use profile names or IDs interchangeably
@@ -98,7 +99,13 @@ nextdnsctl denylist list <profile> --inactive-only
 ```bash
 nextdnsctl denylist add <profile> domain1.com domain2.com
 nextdnsctl denylist add <profile> domain.com --inactive
+nextdnsctl denylist add <profile> domain.com --update-existing
 ```
+
+Add operations fetch the current list first and only create missing domains. Domains
+already present with the requested active/inactive state are skipped. If a domain is
+already present with the opposite state, it is reported and left unchanged unless
+`--update-existing` is passed.
 
 ### Remove domains
 
@@ -106,12 +113,16 @@ nextdnsctl denylist add <profile> domain.com --inactive
 nextdnsctl denylist remove <profile> domain1.com domain2.com
 ```
 
+Remove operations compare against the current list first and skip domains that are
+not present.
+
 ### Import from file or URL
 
 ```bash
 nextdnsctl denylist import <profile> /path/to/blocklist.txt
 nextdnsctl denylist import <profile> https://example.com/blocklist.txt
 nextdnsctl denylist import <profile> blocklist.txt --inactive
+nextdnsctl denylist import <profile> blocklist.txt --update-existing
 ```
 
 The import file format supports:
@@ -119,6 +130,10 @@ The import file format supports:
 - Comments starting with `#`
 - Inline comments (e.g., `example.com # reason`)
 - Empty lines (ignored)
+
+Import is delta-aware: `nextdnsctl` fetches the current list once, deduplicates the
+input, and only sends API writes for missing domains. This reduces rate-limit pressure
+when re-importing the same or overlapping lists.
 
 ### Export to file
 
@@ -166,9 +181,10 @@ Preview changes before applying them:
 
 ```bash
 $ nextdnsctl --dry-run denylist add myprofile bad.com evil.com
-[DRY-RUN] Would add 2 domain(s):
-  - bad.com
-  - evil.com
+[DRY-RUN] Denylist plan:
+  New domains to add: 2
+    - bad.com
+    - evil.com
 
 [DRY-RUN] No changes made.
 ```

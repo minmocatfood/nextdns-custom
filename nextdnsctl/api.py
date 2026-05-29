@@ -1,4 +1,5 @@
 import re
+import threading
 import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
@@ -30,6 +31,28 @@ class InvalidDomainError(Exception):
     """Raised when a domain name is invalid."""
 
     pass
+
+
+class APIError(Exception):
+    """Raised when the NextDNS API returns an error response."""
+
+    pass
+
+
+def _extract_api_error_detail(error_data: Any) -> str:
+    """Extract a user-readable detail from a NextDNS API error payload."""
+    if not isinstance(error_data, dict):
+        return "Unknown error"
+
+    errors = error_data.get("errors")
+    if not errors:
+        return "Unknown error"
+
+    first_error = errors[0]
+    if not isinstance(first_error, dict):
+        return str(first_error)
+
+    return first_error.get("detail") or first_error.get("title") or first_error.get("code") or str(first_error)
 
 
 def validate_domain(domain: str) -> str:
@@ -104,14 +127,34 @@ class APIClient:
         self.delay = delay
         self.timeout = timeout
 
-        # Create persistent session for connection reuse
-        self.session = requests.Session()
-        self.session.headers.update(
+        self._session_local = threading.local()
+        self._sessions: List[requests.Session] = []
+        self._sessions_lock = threading.Lock()
+
+        # Create a main-thread session for connection reuse and backwards compatibility.
+        self.session = self._create_session()
+        self._session_local.session = self.session
+
+    def _create_session(self) -> requests.Session:
+        """Create a configured session and track it for cleanup."""
+        session = requests.Session()
+        session.headers.update(
             {
-                "X-Api-Key": api_key,
+                "X-Api-Key": self.api_key,
                 "User-Agent": USER_AGENT,
             }
         )
+        with self._sessions_lock:
+            self._sessions.append(session)
+        return session
+
+    def _get_session(self) -> requests.Session:
+        """Return a thread-local session."""
+        session = getattr(self._session_local, "session", None)
+        if session is None:
+            session = self._create_session()
+            self._session_local.session = session
+        return session
 
     def call(
         self,
@@ -131,7 +174,7 @@ class APIClient:
 
         for attempt in range(retries + 1):
             try:
-                response = self.session.request(method, url, json=data, timeout=timeout)
+                response = self._get_session().request(method, url, json=data, timeout=timeout)
 
                 if response.status_code == 429:
                     retry_after_header = response.headers.get("Retry-After")
@@ -176,17 +219,20 @@ class APIClient:
 
                     try:
                         error_data = response.json()
-                        errors = error_data.get("errors", [{"detail": "Unknown error"}])
-                        detail = errors[0].get("detail", "Unknown error") if errors else "Unknown error"
-                        raise Exception(f"API error: {detail} (Status: {response.status_code})")
+                        detail = _extract_api_error_detail(error_data)
+                        raise APIError(f"API error: {detail} (Status: {response.status_code})")
                     except ValueError:
-                        raise Exception(
+                        raise APIError(
                             f"API request failed with status {response.status_code} " f"and non-JSON response."
                         )
 
                 if response.status_code == 204:
                     return None
-                return response.json()
+                response_data = response.json()
+                if isinstance(response_data, dict) and response_data.get("errors"):
+                    detail = _extract_api_error_detail(response_data)
+                    raise APIError(f"API error: {detail} (Status: {response.status_code})")
+                return response_data
 
             except RequestException as e:
                 if attempt < retries:
@@ -204,7 +250,11 @@ class APIClient:
 
     def close(self) -> None:
         """Close the session and release resources."""
-        self.session.close()
+        with self._sessions_lock:
+            sessions = list(self._sessions)
+            self._sessions.clear()
+        for session in sessions:
+            session.close()
 
     def __enter__(self) -> "APIClient":
         return self
@@ -244,6 +294,11 @@ class APIClient:
         """Remove a domain from a list (denylist/allowlist)."""
         self.call("DELETE", f"profiles/{profile_id}/{list_type}/{domain}")
         return f"Removed {domain}"
+
+    def update_domain_list_entry(self, profile_id: str, list_type: str, domain: str, active: bool) -> str:
+        """Update a domain entry in a list (denylist/allowlist)."""
+        self.call("PATCH", f"profiles/{profile_id}/{list_type}/{domain}", data={"active": active})
+        return f"Updated {domain} to {'active' if active else 'inactive'}"
 
 
 # Module-level client for backwards compatibility
@@ -321,6 +376,18 @@ def remove_from_domain_list(profile_id: str, list_type: str, domain: str, **kwar
     return client.remove_from_domain_list(profile_id, list_type, domain)
 
 
+def update_domain_list_entry(
+    profile_id: str,
+    list_type: str,
+    domain: str,
+    active: bool,
+    **kwargs: Any,
+) -> str:
+    """Update a domain entry in a list (denylist/allowlist)."""
+    client = _get_client(**kwargs)
+    return client.update_domain_list_entry(profile_id, list_type, domain, active)
+
+
 # Convenience wrappers for backwards compatibility
 def get_denylist(profile_id: str, **kwargs: Any) -> List[Dict[str, Any]]:
     """Retrieve the current denylist for a profile."""
@@ -337,6 +404,11 @@ def remove_from_denylist(profile_id: str, domain: str, **kwargs: Any) -> str:
     return remove_from_domain_list(profile_id, "denylist", domain, **kwargs)
 
 
+def update_denylist_entry(profile_id: str, domain: str, active: bool, **kwargs: Any) -> str:
+    """Update a denylist entry."""
+    return update_domain_list_entry(profile_id, "denylist", domain, active, **kwargs)
+
+
 def get_allowlist(profile_id: str, **kwargs: Any) -> List[Dict[str, Any]]:
     """Retrieve the current allowlist for a profile."""
     return get_domain_list(profile_id, "allowlist", **kwargs)
@@ -350,3 +422,8 @@ def add_to_allowlist(profile_id: str, domain: str, active: bool = True, **kwargs
 def remove_from_allowlist(profile_id: str, domain: str, **kwargs: Any) -> str:
     """Remove a domain from the allowlist."""
     return remove_from_domain_list(profile_id, "allowlist", domain, **kwargs)
+
+
+def update_allowlist_entry(profile_id: str, domain: str, active: bool, **kwargs: Any) -> str:
+    """Update an allowlist entry."""
+    return update_domain_list_entry(profile_id, "allowlist", domain, active, **kwargs)

@@ -10,9 +10,9 @@ Thanks for your interest in contributing!
 5. Open a pull request against `main`.
 
 ## Development Setup
-- Install Python 3.6+.
+- Install Python 3.10+.
 - Clone your fork: `git clone https://github.com/<your-username>/nextdnsctl.git`.
-- Install dependencies: `pip install -r requirements.txt` (create this file if needed).
+- Install dependencies: `pip install -r requirements-dev.txt`.
 - Run locally: `python -m nextdnsctl.nextdnsctl`.
 
 ## Ideas

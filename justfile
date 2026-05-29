@@ -45,7 +45,8 @@ build:
 publish: build
     .venv/bin/python -m twine upload dist/*
 
-# Create a new release (bump version, tag, and push)
+# Create a new release (bump version, tag, push, and publish GitHub release)
+# Requires GitHub CLI authentication. Publishing the GitHub release triggers PyPI.
 # Usage: just release 1.2.0
 release version:
     @echo "Updating version to {{version}}..."
@@ -55,8 +56,9 @@ release version:
     git tag -a "v{{version}}" -m "Release v{{version}}"
     git push origin main
     git push origin "v{{version}}"
+    gh release create "v{{version}}" --title "v{{version}}" --notes "Release v{{version}}"
     @echo "Release v{{version}} tagged and pushed!"
-    @echo "GitHub Actions will publish to PyPI automatically."
+    @echo "GitHub release published. GitHub Actions will publish to PyPI automatically."
     @echo "Or run 'just publish' to publish manually."
 
 # Clean build artifacts

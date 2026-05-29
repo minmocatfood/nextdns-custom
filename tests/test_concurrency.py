@@ -21,6 +21,7 @@ class TestConcurrency:
 
         with rm.Mocker() as m:
             m.get(f"{API_BASE}profiles", json=mock_profiles_response)
+            m.get(f"{API_BASE}profiles/abc1234/denylist", json={"data": []})
             m.post(
                 f"{API_BASE}profiles/abc1234/denylist",
                 json={"id": "test", "active": True},
@@ -57,6 +58,7 @@ class TestConcurrency:
 
         with rm.Mocker() as m:
             m.get(f"{API_BASE}profiles", json=mock_profiles_response)
+            m.get(f"{API_BASE}profiles/abc1234/denylist", json={"data": []})
             m.post(
                 f"{API_BASE}profiles/abc1234/denylist",
                 json={"id": "test", "active": True},

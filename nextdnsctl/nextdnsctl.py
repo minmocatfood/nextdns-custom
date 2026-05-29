@@ -1,6 +1,7 @@
 import atexit
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
@@ -29,6 +30,26 @@ from .api import (
 )
 
 DEFAULT_CONCURRENCY = 5
+
+
+@dataclass(frozen=True)
+class DomainAddPlan:
+    """Planned changes for add/import operations."""
+
+    to_add: list[str]
+    to_update: list[str]
+    already_present: list[str]
+    skipped_mismatched: list[str]
+    duplicate_input: list[str]
+
+
+@dataclass(frozen=True)
+class DomainRemovalPlan:
+    """Planned changes for remove operations."""
+
+    to_remove: list[str]
+    missing: list[str]
+    duplicate_input: list[str]
 
 
 def _resolve_profile_id(ctx: click.Context, profile_identifier: str) -> str:
@@ -81,6 +102,162 @@ def _validate_domains(domains: Sequence[str]) -> tuple[list[str], list[str]]:
         except InvalidDomainError as e:
             invalid.append(str(e))
     return valid, invalid
+
+
+def _dedupe_domains(domains: Sequence[str]) -> tuple[list[str], list[str]]:
+    """Deduplicate domains while preserving first-seen order."""
+    seen = set()
+    unique = []
+    duplicates = []
+    for domain in domains:
+        if domain in seen:
+            duplicates.append(domain)
+            continue
+        seen.add(domain)
+        unique.append(domain)
+    return unique, duplicates
+
+
+def _existing_domain_states(entries: Sequence[dict[str, Any]]) -> dict[str, bool]:
+    """Map existing list entries to their active state."""
+    states = {}
+    for entry in entries:
+        domain = entry.get("id")
+        if not domain:
+            continue
+        states[str(domain).lower()] = bool(entry.get("active", True))
+    return states
+
+
+def _plan_domain_additions(
+    domains: Sequence[str],
+    existing_entries: Sequence[dict[str, Any]],
+    desired_active: bool,
+    update_existing: bool,
+) -> DomainAddPlan:
+    """Plan add/import work against the current remote list."""
+    unique_domains, duplicate_input = _dedupe_domains(domains)
+    existing_states = _existing_domain_states(existing_entries)
+
+    to_add = []
+    to_update = []
+    already_present = []
+    skipped_mismatched = []
+
+    for domain in unique_domains:
+        if domain not in existing_states:
+            to_add.append(domain)
+            continue
+
+        if existing_states[domain] == desired_active:
+            already_present.append(domain)
+        elif update_existing:
+            to_update.append(domain)
+        else:
+            skipped_mismatched.append(domain)
+
+    return DomainAddPlan(
+        to_add=to_add,
+        to_update=to_update,
+        already_present=already_present,
+        skipped_mismatched=skipped_mismatched,
+        duplicate_input=duplicate_input,
+    )
+
+
+def _plan_domain_removals(
+    domains: Sequence[str],
+    existing_entries: Sequence[dict[str, Any]],
+) -> DomainRemovalPlan:
+    """Plan remove work against the current remote list."""
+    unique_domains, duplicate_input = _dedupe_domains(domains)
+    existing_domains = set(_existing_domain_states(existing_entries))
+
+    to_remove = []
+    missing = []
+    for domain in unique_domains:
+        if domain in existing_domains:
+            to_remove.append(domain)
+        else:
+            missing.append(domain)
+
+    return DomainRemovalPlan(to_remove=to_remove, missing=missing, duplicate_input=duplicate_input)
+
+
+def _past_tense(action_verb: str) -> str:
+    """Return the past tense used in operation summaries."""
+    return {
+        "add": "added",
+        "remove": "removed",
+        "update": "updated",
+        "process": "processed",
+    }.get(action_verb, f"{action_verb}ed")
+
+
+def _echo_plan_items(label: str, domains: Sequence[str], limit: int = 20) -> None:
+    """Echo a short domain preview for dry-run plans."""
+    if not domains:
+        return
+
+    click.echo(f"  {label}: {len(domains)}")
+    for domain in domains[:limit]:
+        click.echo(f"    - {domain}")
+    remaining = len(domains) - limit
+    if remaining > 0:
+        click.echo(f"    ... {remaining} more")
+
+
+def _echo_add_plan_summary(
+    plan: DomainAddPlan,
+    list_type: str,
+    update_existing: bool,
+    dry_run: bool,
+) -> None:
+    """Print a user-facing add/import plan summary."""
+    prefix = "[DRY-RUN] " if dry_run else ""
+    click.echo(f"{prefix}{list_type.capitalize()} plan:")
+
+    if dry_run:
+        _echo_plan_items("New domains to add", plan.to_add)
+        _echo_plan_items("Existing domains to update", plan.to_update)
+        _echo_plan_items("Already present", plan.already_present)
+        _echo_plan_items("State mismatches skipped", plan.skipped_mismatched)
+        _echo_plan_items("Duplicate input skipped", plan.duplicate_input)
+    else:
+        click.echo(f"  New domains to add: {len(plan.to_add)}")
+        if plan.to_update:
+            click.echo(f"  Existing domains to update: {len(plan.to_update)}")
+        if plan.already_present:
+            click.echo(f"  Already present: {len(plan.already_present)}")
+        if plan.duplicate_input:
+            click.echo(f"  Duplicate input skipped: {len(plan.duplicate_input)}")
+        if plan.skipped_mismatched:
+            click.echo(f"  State mismatches skipped: {len(plan.skipped_mismatched)}")
+            if not update_existing:
+                click.echo("  Use --update-existing to update active/inactive state.")
+
+    if not plan.to_add and not plan.to_update:
+        click.echo("  No changes needed.")
+
+
+def _echo_removal_plan_summary(plan: DomainRemovalPlan, list_type: str, dry_run: bool) -> None:
+    """Print a user-facing remove plan summary."""
+    prefix = "[DRY-RUN] " if dry_run else ""
+    click.echo(f"{prefix}{list_type.capitalize()} removal plan:")
+
+    if dry_run:
+        _echo_plan_items("Domains to remove", plan.to_remove)
+        _echo_plan_items("Missing domains skipped", plan.missing)
+        _echo_plan_items("Duplicate input skipped", plan.duplicate_input)
+    else:
+        click.echo(f"  Domains to remove: {len(plan.to_remove)}")
+        if plan.missing:
+            click.echo(f"  Missing domains skipped: {len(plan.missing)}")
+        if plan.duplicate_input:
+            click.echo(f"  Duplicate input skipped: {len(plan.duplicate_input)}")
+
+    if not plan.to_remove:
+        click.echo("  No changes needed.")
 
 
 # Helper function to perform operations on a list of domains
@@ -146,13 +323,14 @@ def _perform_domain_operations_sequential(
     """Sequential execution with verbose per-domain output (original behavior)."""
     all_successful = True
     failure_count = 0
+    action_past_tense = _past_tense(action_verb)
     for item_value in domains_to_process:
         try:
             result = operation_callable(item_value)
             click.echo(result)
         except RateLimitStillActiveError as e:
             click.echo(
-                f"\nCRITICAL ERROR: Domain '{item_value}' could not be {action_verb}ed "
+                f"\nCRITICAL ERROR: Domain '{item_value}' could not be {action_past_tense} "
                 f"due to persistent rate limiting.",
                 err=True,
             )
@@ -168,7 +346,8 @@ def _perform_domain_operations_sequential(
             )
     if not all_successful and failure_count > 0:
         click.echo(
-            f"\nWarning: {failure_count} {item_name_singular}(s) could not be {action_verb}ed " f"due to other errors.",
+            f"\nWarning: {failure_count} {item_name_singular}(s) could not be {action_past_tense} "
+            f"due to other errors.",
             err=True,
         )
     return all_successful
@@ -189,37 +368,55 @@ def _perform_domain_operations_parallel(
     rate_limit_aborted = False
 
     total_domains = len(domains_to_process)
+    domain_iterator = iter(domains_to_process)
 
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = {}
-        for domain in domains_to_process:
-            if rate_limit_hit.is_set():
-                results["skipped"] += 1
-                continue
-            futures[executor.submit(operation_callable, domain)] = domain
 
-        submitted_count = len(futures)
+        def submit_next() -> bool:
+            if rate_limit_hit.is_set():
+                return False
+            try:
+                domain = next(domain_iterator)
+            except StopIteration:
+                return False
+            futures[executor.submit(operation_callable, domain)] = domain
+            return True
+
+        for _ in range(min(concurrency, total_domains)):
+            submit_next()
 
         progress_bar: Any = click.progressbar(
-            length=submitted_count,
+            length=total_domains,
             label=f"Processing {item_name_singular}s",
             show_pos=True,
         )
         with progress_bar as bar:
-            for future in as_completed(futures):
-                domain = futures[future]
-                try:
-                    future.result()
-                    results["success"] += 1
-                except RateLimitStillActiveError as e:
-                    rate_limit_hit.set()
-                    rate_limit_aborted = True
-                    results["failed"] += 1
-                    errors.append(f"CRITICAL: '{domain}' - persistent rate limiting: {e}")
-                except Exception as e:
-                    results["failed"] += 1
-                    errors.append(f"Failed to {action_verb} '{domain}': {e}")
-                bar.update(1)
+            while futures:
+                completed_futures, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in completed_futures:
+                    domain = futures.pop(future)
+                    try:
+                        future.result()
+                        results["success"] += 1
+                    except RateLimitStillActiveError as e:
+                        rate_limit_hit.set()
+                        rate_limit_aborted = True
+                        results["failed"] += 1
+                        errors.append(f"CRITICAL: '{domain}' - persistent rate limiting: {e}")
+                    except Exception as e:
+                        results["failed"] += 1
+                        errors.append(f"Failed to {action_verb} '{domain}': {e}")
+                    bar.update(1)
+
+                    if not rate_limit_hit.is_set():
+                        submit_next()
+
+            if rate_limit_hit.is_set():
+                skipped = sum(1 for _ in domain_iterator)
+                results["skipped"] += skipped
+                if skipped:
+                    bar.update(skipped)
 
     # Print any errors that occurred
     for error in errors:
@@ -377,6 +574,103 @@ def _parse_domain_line(line: str) -> Optional[str]:
     return line if line else None
 
 
+def _execute_add_plan(
+    ctx: click.Context,
+    client: APIClient,
+    profile_id: str,
+    list_type: str,
+    plan: DomainAddPlan,
+    desired_active: bool,
+    update_existing: bool,
+) -> None:
+    """Execute or dry-run an add/import delta plan."""
+    dry_run = ctx.obj.get("dry_run", False)
+    _echo_add_plan_summary(plan, list_type, update_existing, dry_run)
+
+    if dry_run:
+        click.echo("\n[DRY-RUN] No changes made.", err=True)
+        return
+
+    if not plan.to_add and not plan.to_update:
+        return
+
+    if plan.to_add:
+
+        def add_operation(domain_name):
+            return client.add_to_domain_list(
+                profile_id,
+                list_type,
+                domain_name,
+                active=desired_active,
+            )
+
+        success = _perform_domain_operations(
+            ctx,
+            plan.to_add,
+            add_operation,
+            item_name_singular="domain",
+            action_verb="add",
+        )
+        if not success:
+            ctx.exit(1)
+
+    if plan.to_update:
+
+        def update_operation(domain_name):
+            return client.update_domain_list_entry(
+                profile_id,
+                list_type,
+                domain_name,
+                active=desired_active,
+            )
+
+        success = _perform_domain_operations(
+            ctx,
+            plan.to_update,
+            update_operation,
+            item_name_singular="domain",
+            action_verb="update",
+        )
+        if not success:
+            ctx.exit(1)
+
+
+def _execute_removal_plan(
+    ctx: click.Context,
+    client: APIClient,
+    profile_id: str,
+    list_type: str,
+    plan: DomainRemovalPlan,
+) -> None:
+    """Execute or dry-run a remove delta plan."""
+    dry_run = ctx.obj.get("dry_run", False)
+    _echo_removal_plan_summary(plan, list_type, dry_run)
+
+    if dry_run:
+        click.echo("\n[DRY-RUN] No changes made.", err=True)
+        return
+
+    if not plan.to_remove:
+        return
+
+    def operation(domain_name):
+        return client.remove_from_domain_list(
+            profile_id,
+            list_type,
+            domain_name,
+        )
+
+    success = _perform_domain_operations(
+        ctx,
+        plan.to_remove,
+        operation,
+        item_name_singular="domain",
+        action_verb="remove",
+    )
+    if not success:
+        ctx.exit(1)
+
+
 # Shared command handlers for denylist/allowlist
 def _handle_list_command(
     ctx: click.Context,
@@ -423,6 +717,7 @@ def _handle_add_command(
     list_type: str,
     domains: Tuple[str, ...],
     inactive: bool,
+    update_existing: bool,
 ) -> None:
     """Shared handler for add commands."""
     if "client" not in ctx.obj:
@@ -444,18 +739,11 @@ def _handle_add_command(
 
     profile_id = _resolve_profile_id(ctx, profile)
     client: APIClient = ctx.obj["client"]
+    existing_entries = client.get_domain_list(profile_id, list_type)
+    desired_active = not inactive
+    plan = _plan_domain_additions(valid_domains, existing_entries, desired_active, update_existing)
 
-    def operation(domain_name):
-        return client.add_to_domain_list(
-            profile_id,
-            list_type,
-            domain_name,
-            active=not inactive,
-        )
-
-    success = _perform_domain_operations(ctx, valid_domains, operation, item_name_singular="domain", action_verb="add")
-    if not success:
-        ctx.exit(1)
+    _execute_add_plan(ctx, client, profile_id, list_type, plan, desired_active, update_existing)
 
     if not ctx.obj.get("dry_run", False):
         click.echo(f"\nView at: https://my.nextdns.io/{profile_id}/{list_type}")
@@ -474,19 +762,22 @@ def _handle_remove_command(
         click.echo("No domains provided.", err=True)
         raise click.Abort()
 
+    valid_domains, invalid_domains = _validate_domains(domains)
+    if invalid_domains:
+        click.echo("Invalid domains skipped:", err=True)
+        for error in invalid_domains:
+            click.echo(f"  - {error}", err=True)
+
+    if not valid_domains:
+        click.echo("No valid domains to remove.", err=True)
+        raise click.Abort()
+
     profile_id = _resolve_profile_id(ctx, profile)
     client: APIClient = ctx.obj["client"]
+    existing_entries = client.get_domain_list(profile_id, list_type)
+    plan = _plan_domain_removals(valid_domains, existing_entries)
 
-    def operation(domain_name):
-        return client.remove_from_domain_list(
-            profile_id,
-            list_type,
-            domain_name,
-        )
-
-    success = _perform_domain_operations(ctx, domains, operation, item_name_singular="domain", action_verb="remove")
-    if not success:
-        ctx.exit(1)
+    _execute_removal_plan(ctx, client, profile_id, list_type, plan)
 
 
 def _handle_import_command(
@@ -495,6 +786,7 @@ def _handle_import_command(
     list_type: str,
     source: str,
     inactive: bool,
+    update_existing: bool,
 ) -> None:
     """Shared handler for import commands."""
     if "client" not in ctx.obj:
@@ -503,8 +795,7 @@ def _handle_import_command(
     client: APIClient = ctx.obj["client"]
 
     try:
-        # Use generator to stream file/URL and collect domains
-        # This avoids loading raw file content into memory
+        # Parse through the streaming source reader, then plan against the current list.
         raw_domains = list(read_domains_from_source(source))
     except Exception as e:
         click.echo(f"Error reading source: {e}", err=True)
@@ -523,23 +814,10 @@ def _handle_import_command(
         click.echo("No valid domains to import.", err=True)
         return
 
-    def operation(domain_name):
-        return client.add_to_domain_list(
-            profile_id,
-            list_type,
-            domain_name,
-            active=not inactive,
-        )
-
-    success = _perform_domain_operations(
-        ctx,
-        valid_domains,
-        operation,
-        item_name_singular="domain",
-        action_verb="add",
-    )
-    if not success:
-        ctx.exit(1)
+    existing_entries = client.get_domain_list(profile_id, list_type)
+    desired_active = not inactive
+    plan = _plan_domain_additions(valid_domains, existing_entries, desired_active, update_existing)
+    _execute_add_plan(ctx, client, profile_id, list_type, plan, desired_active, update_existing)
 
     if not ctx.obj.get("dry_run", False):
         click.echo(f"\nView at: https://my.nextdns.io/{profile_id}/{list_type}")
@@ -652,10 +930,11 @@ def denylist_list(ctx, profile, active_only, inactive_only):
 @click.argument("profile")
 @click.argument("domains", nargs=-1)
 @click.option("--inactive", is_flag=True, help="Add domains as inactive (not blocked)")
+@click.option("--update-existing", is_flag=True, help="Update active state for domains already in the list")
 @click.pass_context
-def denylist_add(ctx, profile, domains, inactive):
+def denylist_add(ctx, profile, domains, inactive, update_existing):
     """Add domains to the NextDNS denylist."""
-    _handle_add_command(ctx, profile, "denylist", domains, inactive)
+    _handle_add_command(ctx, profile, "denylist", domains, inactive, update_existing)
 
 
 @denylist.command("remove")
@@ -671,10 +950,11 @@ def denylist_remove(ctx, profile, domains):
 @click.argument("profile")
 @click.argument("source")
 @click.option("--inactive", is_flag=True, help="Add domains as inactive (not blocked)")
+@click.option("--update-existing", is_flag=True, help="Update active state for domains already in the list")
 @click.pass_context
-def denylist_import(ctx, profile, source, inactive):
+def denylist_import(ctx, profile, source, inactive, update_existing):
     """Import domains from a file or URL to the NextDNS denylist."""
-    _handle_import_command(ctx, profile, "denylist", source, inactive)
+    _handle_import_command(ctx, profile, "denylist", source, inactive, update_existing)
 
 
 @denylist.command("export")
@@ -716,10 +996,11 @@ def allowlist_list(ctx, profile, active_only, inactive_only):
 @click.argument("profile")
 @click.argument("domains", nargs=-1)
 @click.option("--inactive", is_flag=True, help="Add domains as inactive (not allowed)")
+@click.option("--update-existing", is_flag=True, help="Update active state for domains already in the list")
 @click.pass_context
-def allowlist_add(ctx, profile, domains, inactive):
+def allowlist_add(ctx, profile, domains, inactive, update_existing):
     """Add domains to the NextDNS allowlist."""
-    _handle_add_command(ctx, profile, "allowlist", domains, inactive)
+    _handle_add_command(ctx, profile, "allowlist", domains, inactive, update_existing)
 
 
 @allowlist.command("remove")
@@ -735,10 +1016,11 @@ def allowlist_remove(ctx, profile, domains):
 @click.argument("profile")
 @click.argument("source")
 @click.option("--inactive", is_flag=True, help="Add domains as inactive (not allowed)")
+@click.option("--update-existing", is_flag=True, help="Update active state for domains already in the list")
 @click.pass_context
-def allowlist_import(ctx, profile, source, inactive):
+def allowlist_import(ctx, profile, source, inactive, update_existing):
     """Import domains from a file or URL to the NextDNS allowlist."""
-    _handle_import_command(ctx, profile, "allowlist", source, inactive)
+    _handle_import_command(ctx, profile, "allowlist", source, inactive, update_existing)
 
 
 @allowlist.command("export")

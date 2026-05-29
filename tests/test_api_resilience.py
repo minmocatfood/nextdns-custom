@@ -3,7 +3,7 @@
 import pytest
 from unittest.mock import Mock, patch
 
-from nextdnsctl.api import APIClient, RateLimitStillActiveError
+from nextdnsctl.api import APIClient, APIError, RateLimitStillActiveError
 
 
 class TestRetryOn500:
@@ -186,6 +186,25 @@ class TestSuccessResponses:
             result = client.call("POST", "test")
 
             assert result == {"id": "new-resource"}
+
+
+class TestApiErrorResponses:
+    """Tests for API error payload handling."""
+
+    def test_raises_error_for_200_response_with_errors_body(self):
+        """NextDNS may return error payloads with a 200 status."""
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"errors": [{"code": "duplicate"}]}
+
+        with patch("requests.Session") as MockSession:
+            mock_session = Mock()
+            mock_session.request.return_value = mock_response
+            MockSession.return_value = mock_session
+
+            client = APIClient("fake-key")
+            with pytest.raises(APIError, match="duplicate"):
+                client.call("POST", "test")
 
 
 class TestSessionReuse:

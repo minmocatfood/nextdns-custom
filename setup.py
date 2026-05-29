@@ -14,7 +14,7 @@ def get_version():
 setup(
     name="nextdnsctl",
     version=get_version(),
-    packages=find_packages(),
+    packages=find_packages(exclude=["tests", "tests.*"]),
     install_requires=[
         "requests",
         "click",
@@ -35,7 +35,6 @@ setup(
     python_requires=">=3.10",
     classifiers=[
         "Development Status :: 5 - Production/Stable",
-        "License :: OSI Approved :: MIT License",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",

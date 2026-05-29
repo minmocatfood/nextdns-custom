@@ -57,6 +57,7 @@ class TestDenylistCommands:
     def test_denylist_add(self, runner, mock_api_key, mock_profiles_response):
         with rm.Mocker() as m:
             m.get(f"{API_BASE}profiles", json=mock_profiles_response)
+            m.get(f"{API_BASE}profiles/abc1234/denylist", json={"data": []})
             adapter = m.post(
                 f"{API_BASE}profiles/abc1234/denylist",
                 json={"id": "bad.com", "active": True},
@@ -71,6 +72,7 @@ class TestDenylistCommands:
     def test_denylist_add_inactive(self, runner, mock_api_key, mock_profiles_response):
         with rm.Mocker() as m:
             m.get(f"{API_BASE}profiles", json=mock_profiles_response)
+            m.get(f"{API_BASE}profiles/abc1234/denylist", json={"data": []})
             adapter = m.post(
                 f"{API_BASE}profiles/abc1234/denylist",
                 json={"id": "bad.com", "active": False},
@@ -95,6 +97,7 @@ class TestDenylistCommands:
     def test_denylist_remove(self, runner, mock_api_key, mock_profiles_response):
         with rm.Mocker() as m:
             m.get(f"{API_BASE}profiles", json=mock_profiles_response)
+            m.get(f"{API_BASE}profiles/abc1234/denylist", json={"data": [{"id": "bad.com", "active": True}]})
             adapter = m.delete(f"{API_BASE}profiles/abc1234/denylist/bad.com", status_code=204)
 
             result = runner.invoke(cli, ["--concurrency", "1", "denylist", "remove", "abc1234", "bad.com"])
@@ -109,6 +112,7 @@ class TestDryRun:
     def test_denylist_add_dry_run_makes_no_requests(self, runner, mock_api_key, mock_profiles_response):
         with rm.Mocker() as m:
             m.get(f"{API_BASE}profiles", json=mock_profiles_response)
+            m.get(f"{API_BASE}profiles/abc1234/denylist", json={"data": []})
             # No POST mock - if it tries to POST, it will fail
             adapter = m.post(f"{API_BASE}profiles/abc1234/denylist", status_code=500)
 
@@ -184,6 +188,7 @@ class TestImportCommand:
 
         with rm.Mocker() as m:
             m.get(f"{API_BASE}profiles", json=mock_profiles_response)
+            m.get(f"{API_BASE}profiles/abc1234/denylist", json={"data": []})
             adapter = m.post(
                 f"{API_BASE}profiles/abc1234/denylist",
                 json={"id": "test", "active": True},
@@ -239,6 +244,7 @@ class TestImportCommand:
 
         with rm.Mocker() as m:
             m.get(f"{API_BASE}profiles", json=mock_profiles_response)
+            m.get(f"{API_BASE}profiles/abc1234/denylist", json={"data": []})
             adapter = m.post(f"{API_BASE}profiles/abc1234/denylist", status_code=500)
 
             result = runner.invoke(cli, ["--dry-run", "denylist", "import", "abc1234", str(domains_file)])
