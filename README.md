@@ -2,10 +2,12 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Build Status](https://github.com/danielmeint/nextdnsctl/actions/workflows/test.yml/badge.svg)](https://github.com/danielmeint/nextdnsctl/actions/workflows/test.yml)
+[forked from danielmeint]
 
 A community-driven CLI tool for managing NextDNS profiles declaratively.
+This fork aims to extend the functionality of the repo to work for large DNS blocklists. 
 
-**Disclaimer**: This is an unofficial tool, not affiliated with NextDNS. Built by a user, for users.
+**Disclaimer**: This is an unofficial tool, not affiliated with NextDNS. Built by a user, for users. 
 
 > **Note**: While `nextdnsctl` handles API rate limiting and retries, it is **not recommended for importing very large
 blocklists**. For large-scale filtering, prefer using NextDNS's built-in curated blocklists under the **Privacy** tab,
